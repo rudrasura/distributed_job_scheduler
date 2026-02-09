@@ -1,0 +1,254 @@
+version: '3.9'
+
+services:
+  scylla:
+    image: scylladb/scylla:5.2.0
+    container_name: scheduler-scylla
+    ports:
+      - "9042:9042" # Native transport
+      - "9160:9160" # Thrift
+      - "10000:10000" # REST API
+    command: --smp 1 --memory 750M --overprovisioned 1 --api-address 0.0.0.0
+    volumes:
+      - scylla-data:/var/lib/scylla
+      - ./db/schema.cql:/opt/schema.cql:ro
+    networks:
+      - scheduler-net
+    restart: always
+
+  schema-init:
+    image: scylladb/scylla:5.2.0
+    container_name: scheduler-schema-init
+    depends_on:
+      - scylla
+    volumes:
+      - ./db/schema.cql:/opt/schema.cql:ro
+      - ./db/init-schema.sh:/opt/init-schema.sh:ro
+    networks:
+      - scheduler-net
+    entrypoint: []
+    command: bash /opt/init-schema.sh
+    restart: "no"
+
+  redis:
+    image: redis:7.0-alpine
+    container_name: scheduler-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - scheduler-net
+    restart: always
+
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.0
+    container_name: scheduler-etcd
+    ports:
+      - "2379:2379"
+      - "2380:2380"
+    environment:
+      - ETCD_NAME=scheduler-etcd
+      - ETCD_ADVERTISE_CLIENT_URLS=http://0.0.0.0:2379
+      - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
+      - ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380
+      - ETCD_INITIAL_ADVERTISE_PEER_URLS=http://0.0.0.0:2380
+      - ETCD_INITIAL_CLUSTER_TOKEN=scheduler-etcd-cluster
+      - ETCD_INITIAL_CLUSTER=scheduler-etcd=http://0.0.0.0:2380
+      - ETCD_INITIAL_CLUSTER_STATE=new
+    volumes:
+      - etcd-data:/etcd-data
+    networks:
+      - scheduler-net
+    restart: always
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    container_name: scheduler-zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - scheduler-net
+    restart: always
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: scheduler-kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: scheduler-zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://scheduler-kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    networks:
+      - scheduler-net
+    restart: always
+
+  sqs:
+    image: softwaremill/elasticmq-native:latest
+    container_name: scheduler-sqs
+    ports:
+      - "9324:9324"
+      - "9325:9325"
+    volumes:
+      - ./config/sqs.conf:/opt/elasticmq.conf
+    networks:
+      - scheduler-net
+
+  s3:
+    image: localstack/localstack:latest
+    container_name: scheduler-s3
+    ports:
+      - "4566:4566"
+    environment:
+      - SERVICES=s3
+      - DEBUG=1
+      - DATA_DIR=/tmp/localstack/data
+    volumes:
+      - "./.localstack:/var/lib/localstack"
+      - "/var/run/docker.sock:/var/run/docker.sock"
+    networks:
+      - scheduler-net
+    restart: always
+
+  prometheus:
+    image: prom/prometheus:v2.45.0
+    container_name: scheduler-prometheus
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - scheduler-net
+    restart: always
+
+  grafana:
+    image: grafana/grafana:10.0.0
+    container_name: scheduler-grafana
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    networks:
+      - scheduler-net
+    restart: always
+
+  ingestion-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: ingestion
+    container_name: scheduler-ingestion
+    ports:
+      - "8080:8080"
+      - "8081:2112"  # Metrics
+    environment:
+      - SCYLLA_HOSTS=scheduler-scylla
+      - REDIS_ADDR=scheduler-redis:6379
+      - KAFKA_BROKERS=scheduler-kafka:29092
+      - S3_ENDPOINT=http://scheduler-s3:4566
+    depends_on:
+      - scylla
+      - redis
+      - kafka
+    networks:
+      - scheduler-net
+    restart: always
+
+  writer-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: writer
+    container_name: scheduler-writer
+    environment:
+      - SCYLLA_HOSTS=scheduler-scylla
+      - KAFKA_BROKERS=scheduler-kafka:29092
+    depends_on:
+      - scylla
+      - kafka
+    networks:
+      - scheduler-net
+    restart: always
+
+  coordinator-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: coordinator
+    container_name: scheduler-coordinator
+    environment:
+      - ETCD_ENDPOINTS=scheduler-etcd:2379
+    depends_on:
+      - etcd
+    networks:
+      - scheduler-net
+    restart: always
+
+  picker-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: picker
+    container_name: scheduler-picker
+    ports:
+      - "8082:2112"  # Metrics
+    environment:
+      - ETCD_ENDPOINTS=scheduler-etcd:2379
+      - SCYLLA_HOSTS=scheduler-scylla
+      - SQS_ENDPOINT=http://scheduler-sqs:9324
+    depends_on:
+      - etcd
+      - scylla
+      - kafka
+    networks:
+      - scheduler-net
+    restart: always
+
+  worker-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: worker
+    container_name: scheduler-worker
+    ports:
+      - "8083:2112"  # Metrics
+    environment:
+      - SCYLLA_HOSTS=scheduler-scylla
+      - SQS_ENDPOINT=http://scheduler-sqs:9324
+      - S3_ENDPOINT=http://scheduler-s3:4566
+    depends_on:
+      - scylla
+      - kafka
+    networks:
+      - scheduler-net
+    restart: always
+
+volumes:
+  scylla-data:
+  redis-data:
+  etcd-data:
+  prometheus-data:
+  grafana-data:
+
+networks:
+  scheduler-net:
+    driver: bridge

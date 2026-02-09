@@ -1,0 +1,40 @@
+events:
+  JobSubmission:
+    topic: "job-submissions"
+    schema:
+      type: object
+      properties:
+        job_id:
+          type: string
+          format: uuid
+        project_id:
+          type: string
+        payload:
+          type: string
+        next_fire_at:
+          type: string
+          format: date-time
+        shard_id:
+          type: integer
+      required: ["job_id", "project_id", "next_fire_at", "shard_id"]
+
+  JobExecution:
+    topic: "job-executions"
+    schema:
+      type: object
+      properties:
+        job_id:
+          type: string
+          format: uuid
+        run_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: ["STARTED", "COMPLETED", "FAILED"]
+        output:
+          type: string
+        executed_at:
+          type: string
+          format: date-time
+      required: ["job_id", "run_id", "status", "executed_at"]

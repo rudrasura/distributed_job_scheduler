@@ -1,0 +1,19 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: 'ingestion-service'
+    static_configs:
+      - targets: ['scheduler-ingestion:2112']
+
+  - job_name: 'picker-service'
+    static_configs:
+      - targets: ['scheduler-picker:2112']
+
+  - job_name: 'worker-service'
+    static_configs:
+      - targets: ['scheduler-worker:2112']
+
+  - job_name: 'scylla'
+    static_configs:
+      - targets: ['scheduler-scylla:9180']
